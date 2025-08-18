@@ -24,10 +24,10 @@ parser.add_argument('shape_id', type=str)
 parser.add_argument('category', type=str)
 parser.add_argument('cnt_id', type=int)
 parser.add_argument('primact_type', type=str)
-parser.add_argument('--out_dir', type=str)
+parser.add_argument('--out_dir', type=str, default='/media/george/Projects/Research/2026-CVPR-BiDexHand/third_party/where2act/code/results')
 parser.add_argument('--trial_id', type=int, default=0, help='trial id')
 parser.add_argument('--random_seed', type=int, default=None)
-parser.add_argument('--no_gui', action='store_true', default=False, help='no_gui [default: False]')
+parser.add_argument('--no_gui', action='store_true', default=True, help='no_gui [default: False]')
 args = parser.parse_args()
 
 shape_id = args.shape_id
