@@ -18,6 +18,7 @@ from sapien.core import Pose
 from env import Env, ContactError
 from camera import Camera
 from robots.panda_robot import Robot
+from robots.shadow_hand_robot import ShadowHandRobot
 
 from PIL import Image
 from subprocess import call
@@ -27,7 +28,20 @@ out_dir = '/'.join(json_fn.split('/')[:-1])
 with open(json_fn, 'r') as fin:
     replay_data = json.load(fin)
 
-shape_id, _, _, primact_type, _ = json_fn.split('/')[-2].split('_')
+# Parse directory name to extract parameters
+dir_parts = json_fn.split('/')[-2].split('_')
+shape_id = dir_parts[0]
+primact_type = dir_parts[3]
+
+# Check if this is Shadow Hand data
+robot_type = 'panda'  # default
+hand_type = 'right'   # default
+if len(dir_parts) >= 6 and dir_parts[5] == 'shadowhand':
+    robot_type = 'shadowhand'
+    if len(dir_parts) >= 7:
+        hand_type = dir_parts[6]
+elif len(dir_parts) >= 6:
+    robot_type = dir_parts[5]
 
 # setup env
 env = Env()
@@ -144,17 +158,31 @@ if action_direction is not None:
     end_rotmat = np.array(rotmat, dtype=np.float32)
     end_rotmat[:3, 3] = position_world - up * final_dist + action_direction * 0.05
 
-# setup robot
-robot_urdf_fn = './robots/panda_gripper.urdf'
+# setup robot based on type
 robot_material = env.get_material(4, 4, 0.01)
-robot = Robot(env, robot_urdf_fn, robot_material, open_gripper=('pulling' in primact_type))
+
+if robot_type == 'shadowhand':
+    # Setup Shadow Hand
+    robot_urdf_fn = f'./robots/shadow_hand_{hand_type}.urdf'
+    robot = ShadowHandRobot(env, robot_urdf_fn, robot_material, hand_type=hand_type)
+    hand_actor_id = robot.palm_actor_id
+    gripper_actor_ids = robot.fingertip_actor_ids
+else:
+    # Setup Panda gripper
+    robot_urdf_fn = './robots/panda_gripper.urdf'
+    robot = Robot(env, robot_urdf_fn, robot_material, open_gripper=('pulling' in primact_type))
+    hand_actor_id = robot.hand_actor_id
+    gripper_actor_ids = robot.gripper_actor_ids
 
 # start pose
-robot.robot.set_root_pose(start_pose)
+if robot_type == 'shadowhand':
+    robot.move_to_pose(start_rotmat, 100)
+else:
+    robot.robot.set_root_pose(start_pose)
 env.render()
 
 # activate contact checking
-env.start_checking_contact(robot.hand_actor_id, robot.gripper_actor_ids, 'pushing' in primact_type)
+env.start_checking_contact(hand_actor_id, gripper_actor_ids, 'pushing' in primact_type)
 
 ### wait to start
 env.wait_to_start()
@@ -166,26 +194,69 @@ target_link_mat44 = env.get_target_part_pose().to_transformation_matrix()
 position_local_xyz1 = np.linalg.inv(target_link_mat44) @ position_world_xyz1
 print(position_local_xyz1)
 
-if 'pushing' in primact_type:
-    robot.close_gripper()
-elif 'pulling' in primact_type:
-    robot.open_gripper()
+if robot_type == 'shadowhand':
+    # Shadow Hand specific replay actions
+    if primact_type == 'grasping':
+        # Approach and grasp
+        robot.move_to_pose(final_rotmat, 2000)
+        robot.wait_n_steps(1000)
+        robot.grasp_object(0.7)
+        robot.wait_n_steps(3000)
+        
+    elif primact_type == 'pinching':
+        # Approach and pinch
+        robot.move_to_pose(final_rotmat, 2000)
+        robot.wait_n_steps(1000)
+        robot.set_finger_position('thumb', [0.5, 0.5, 0.5])
+        robot.set_finger_position('first_finger', [0.5, 0.5, 0.5])
+        robot.wait_n_steps(3000)
+        
+    elif 'pushing' in primact_type:
+        # Open hand for pushing
+        robot.open_hand()
+        robot.wait_n_steps(1000)
+        robot.move_to_pose(final_rotmat, 2000)
+        robot.wait_n_steps(2000)
+        
+        if 'left' in primact_type or 'up' in primact_type:
+            robot.move_to_pose(end_rotmat, 2000)
+            robot.wait_n_steps(2000)
+            
+    elif 'pulling' in primact_type:
+        # Approach, grasp, and pull
+        robot.move_to_pose(final_rotmat, 2000)
+        robot.wait_n_steps(1000)
+        robot.grasp_object(0.7)
+        robot.wait_n_steps(2000)
+        
+        if 'left' in primact_type or 'up' in primact_type:
+            robot.move_to_pose(end_rotmat, 2000)
+        else:
+            robot.move_to_pose(start_rotmat, 2000)
+        robot.wait_n_steps(2000)
+        
+else:
+    # Original Panda gripper logic
+    if 'pushing' in primact_type:
+        robot.close_gripper()
+    elif 'pulling' in primact_type:
+        robot.open_gripper()
 
-# approach
-robot.move_to_target_pose(final_rotmat, 2000)
-robot.wait_n_steps(2000)
-
-if 'pulling' in primact_type:
-    robot.close_gripper()
+    # approach
+    robot.move_to_target_pose(final_rotmat, 2000)
     robot.wait_n_steps(2000)
 
-if 'left' in primact_type or 'up' in primact_type:
-    robot.move_to_target_pose(end_rotmat, 2000)
-    robot.wait_n_steps(2000)
+    if 'pulling' in primact_type:
+        robot.close_gripper()
+        robot.wait_n_steps(2000)
 
-if primact_type == 'pulling':
-    robot.move_to_target_pose(start_rotmat, 2000)
-    robot.wait_n_steps(2000)
+    if 'left' in primact_type or 'up' in primact_type:
+        robot.move_to_target_pose(end_rotmat, 2000)
+        robot.wait_n_steps(2000)
+
+    if primact_type == 'pulling':
+        robot.move_to_target_pose(start_rotmat, 2000)
+        robot.wait_n_steps(2000)
 
 target_link_mat44 = env.get_target_part_pose().to_transformation_matrix()
 position_world_xyz1_end = target_link_mat44 @ position_local_xyz1
