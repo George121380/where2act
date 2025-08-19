@@ -1,6 +1,5 @@
 """
-    For panda (two-finger) gripper and Shadow Hand: pushing, pushing-left, pushing-up, pulling, pulling-left, pulling-up
-    Shadow Hand also supports: grasping, pinching
+    For panda (two-finger) gripper: pushing, pushing-left, pushing-up, pulling, pulling-left, pulling-up
         50% all parts closed, 50% middle (for each part, 50% prob. closed, 50% prob. middle)
         Simulate until static before starting
 """
@@ -19,7 +18,7 @@ from sapien.core import Pose
 from env import Env, ContactError
 from camera import Camera
 from robots.panda_robot import Robot
-from robots.shadow_hand_robot import ShadowHandRobot
+from robots.shadowhand_robot import ShadowHandRobot
 
 parser = ArgumentParser()
 parser.add_argument('shape_id', type=str)
@@ -30,28 +29,17 @@ parser.add_argument('--out_dir', type=str, default='/media/george/Projects/Resea
 parser.add_argument('--trial_id', type=int, default=0, help='trial id')
 parser.add_argument('--random_seed', type=int, default=None)
 parser.add_argument('--no_gui', action='store_true', default=True, help='no_gui [default: False]')
-parser.add_argument('--robot_type', type=str, default='panda', choices=['panda', 'shadowhand'], 
-                   help='Robot type: panda or shadowhand [default: panda]')
-parser.add_argument('--hand_type', type=str, default='right', choices=['right', 'left'], 
-                   help='Shadow Hand type: right or left (only for shadowhand robot) [default: right]')
+parser.add_argument('--robot_type', type=str, default='panda', choices=['panda', 'shadowhand'], help='robot type to use')
+parser.add_argument('--shadowhand_urdf', type=str, default='./robots/shadowhand/shadowhand_ign_shadow_hand_fixed.urdf', help='URDF path for Shadow Hand')
 args = parser.parse_args()
 
 shape_id = args.shape_id
 trial_id = args.trial_id
 primact_type = args.primact_type
-robot_type = args.robot_type
-hand_type = args.hand_type
-
-# Create output directory name with robot type
-if robot_type == 'shadowhand':
-    dir_suffix = '%s_%s_%d_%s_%d_%s_%s' % (shape_id, args.category, args.cnt_id, primact_type, trial_id, robot_type, hand_type)
-else:
-    dir_suffix = '%s_%s_%d_%s_%d_%s' % (shape_id, args.category, args.cnt_id, primact_type, trial_id, robot_type)
-
 if args.no_gui:
-    out_dir = os.path.join(args.out_dir, dir_suffix)
+    out_dir = os.path.join(args.out_dir, '%s_%s_%d_%s_%d' % (shape_id, args.category, args.cnt_id, primact_type, trial_id))
 else:
-    out_dir = os.path.join('results', dir_suffix)
+    out_dir = os.path.join('results', '%s_%s_%d_%s_%d' % (shape_id, args.category, args.cnt_id, primact_type, trial_id))
 if os.path.exists(out_dir):
     shutil.rmtree(out_dir)
 os.mkdir(out_dir)
@@ -219,41 +207,32 @@ if action_direction is not None:
     out_info['end_rotmat_world'] = end_rotmat.tolist()
 
 
-### Setup robot based on robot type
+### viz the EE gripper position
+# setup robot
 robot_material = env.get_material(4, 4, 0.01)
-
-if robot_type == 'shadowhand':
-    # Setup Shadow Hand
-    robot_urdf_fn = f'./robots/shadow_hand_{hand_type}.urdf'
-    robot = ShadowHandRobot(env, robot_urdf_fn, robot_material, hand_type=hand_type)
-    # For Shadow Hand, we use palm and fingertips for contact detection
-    hand_actor_id = robot.palm_actor_id
-    gripper_actor_ids = robot.fingertip_actor_ids
-else:
-    # Setup Panda gripper
+if args.robot_type == 'panda':
     robot_urdf_fn = './robots/panda_gripper.urdf'
     robot = Robot(env, robot_urdf_fn, robot_material, open_gripper=('pulling' in primact_type))
-    hand_actor_id = robot.hand_actor_id
-    gripper_actor_ids = robot.gripper_actor_ids
-
-# move to the final pose for visualization
-if robot_type == 'shadowhand':
-    robot.move_to_pose(final_rotmat, 100)
 else:
-    robot.robot.set_root_pose(final_pose)
+    robot_urdf_fn = args.shadowhand_urdf
+    robot = ShadowHandRobot(env, robot_urdf_fn, robot_material, open_gripper=('pulling' in primact_type))
+
+# record robot metadata
+out_info['robot_type'] = args.robot_type
+out_info['robot_urdf'] = robot_urdf_fn
+
+# move to the final pose
+robot.robot.set_root_pose(final_pose)
 env.render()
 rgb_final_pose, _ = cam.get_observation()
 Image.fromarray((rgb_final_pose*255).astype(np.uint8)).save(os.path.join(out_dir, 'viz_target_pose.png'))
 
-# move back to start pose
-if robot_type == 'shadowhand':
-    robot.move_to_pose(start_rotmat, 100)
-else:
-    robot.robot.set_root_pose(start_pose)
+# move back
+robot.robot.set_root_pose(start_pose)
 env.render()
 
 # activate contact checking
-env.start_checking_contact(hand_actor_id, gripper_actor_ids, 'pushing' in primact_type)
+env.start_checking_contact(robot.hand_actor_id, robot.gripper_actor_ids, 'pushing' in primact_type)
 
 if not args.no_gui:
     ### wait to start
@@ -267,69 +246,26 @@ position_local_xyz1 = np.linalg.inv(target_link_mat44) @ position_world_xyz1
 
 success = True
 try:
-    if robot_type == 'shadowhand':
-        # Shadow Hand specific actions
-        if primact_type == 'grasping':
-            # Approach and grasp
-            robot.move_to_pose(final_rotmat, 2000)
-            robot.wait_n_steps(1000)
-            robot.grasp_object(0.7)
-            robot.wait_n_steps(3000)
-            
-        elif primact_type == 'pinching':
-            # Approach and pinch with thumb and index finger
-            robot.move_to_pose(final_rotmat, 2000)
-            robot.wait_n_steps(1000)
-            robot.set_finger_position('thumb', [0.5, 0.5, 0.5])
-            robot.set_finger_position('first_finger', [0.5, 0.5, 0.5])
-            robot.wait_n_steps(3000)
-            
-        elif 'pushing' in primact_type:
-            # Open hand for pushing
-            robot.open_hand()
-            robot.wait_n_steps(1000)
-            robot.move_to_pose(final_rotmat, 2000)
-            robot.wait_n_steps(2000)
-            
-            if 'left' in primact_type or 'up' in primact_type:
-                robot.move_to_pose(end_rotmat, 2000)
-                robot.wait_n_steps(2000)
-                
-        elif 'pulling' in primact_type:
-            # Approach, grasp, and pull
-            robot.move_to_pose(final_rotmat, 2000)
-            robot.wait_n_steps(1000)
-            robot.grasp_object(0.7)
-            robot.wait_n_steps(2000)
-            
-            if 'left' in primact_type or 'up' in primact_type:
-                robot.move_to_pose(end_rotmat, 2000)
-            else:
-                robot.move_to_pose(start_rotmat, 2000)
-            robot.wait_n_steps(2000)
-            
-    else:
-        # Original Panda gripper logic
-        if 'pushing' in primact_type:
-            robot.close_gripper()
-        elif 'pulling' in primact_type:
-            robot.open_gripper()
+    if 'pushing' in primact_type:
+        robot.close_gripper()
+    elif 'pulling' in primact_type:
+        robot.open_gripper()
 
-        # approach
-        robot.move_to_target_pose(final_rotmat, 2000)
+    # approach
+    robot.move_to_target_pose(final_rotmat, 2000)
+    robot.wait_n_steps(2000)
+
+    if 'pulling' in primact_type:
+        robot.close_gripper()
         robot.wait_n_steps(2000)
-
-        if 'pulling' in primact_type:
-            robot.close_gripper()
-            robot.wait_n_steps(2000)
-        
-        if 'left' in primact_type or 'up' in primact_type:
-            robot.move_to_target_pose(end_rotmat, 2000)
-            robot.wait_n_steps(2000)
-        
-        if primact_type == 'pulling':
-            robot.move_to_target_pose(start_rotmat, 2000)
-            robot.wait_n_steps(2000)
+    
+    if 'left' in primact_type or 'up' in primact_type:
+        robot.move_to_target_pose(end_rotmat, 2000)
+        robot.wait_n_steps(2000)
+    
+    if primact_type == 'pulling':
+        robot.move_to_target_pose(start_rotmat, 2000)
+        robot.wait_n_steps(2000)
 
 except ContactError:
     success = False
@@ -344,19 +280,8 @@ out_info['touch_position_world_xyz_end'] = position_world_xyz1_end[:3].tolist()
 if success:
     out_info['result'] = 'VALID'
     out_info['final_target_part_qpos'] = env.get_target_part_qpos()
-    
-    # Add Shadow Hand specific information
-    if robot_type == 'shadowhand':
-        out_info['final_hand_state'] = robot.get_hand_state()
-        out_info['contact_forces'] = {k: v.tolist() for k, v in robot.get_contact_forces().items()}
-        out_info['object_contacted'] = robot.check_object_contact([env.target_object_part_actor_id])
 else:
     out_info['result'] = 'CONTACT_ERROR'
-
-# Add robot configuration info
-out_info['robot_type'] = robot_type
-if robot_type == 'shadowhand':
-    out_info['hand_type'] = hand_type
 
 # save results
 with open(os.path.join(out_dir, 'result.json'), 'w') as fout:
@@ -370,11 +295,11 @@ if args.no_gui:
     env.close()
 else:
     if success:
-        print(f'[Successful {robot_type.title()} Interaction] Done. Ctrl-C to quit.')
+        print('[Successful Interaction] Done. Ctrl-C to quit.')
         ### wait forever
         robot.wait_n_steps(100000000000)
     else:
-        print(f'[Unsuccessful {robot_type.title()} Interaction] invalid hand-object contact.')
+        print('[Unsuccessful Interaction] invalid gripper-object contact.')
         # close env
         env.close()
 
