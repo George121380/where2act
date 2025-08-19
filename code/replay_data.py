@@ -18,11 +18,19 @@ from sapien.core import Pose
 from env import Env, ContactError
 from camera import Camera
 from robots.panda_robot import Robot
+from robots.shadowhand_robot import ShadowHandRobot
 
 from PIL import Image
 from subprocess import call
 
 json_fn = sys.argv[1]
+robot_type = None
+no_gui = False
+# optional args: [robot_type] [no_gui]
+if len(sys.argv) > 2 and sys.argv[2].strip() != "":
+    robot_type = sys.argv[2]
+if len(sys.argv) > 3 and sys.argv[3].strip().lower() in ["no_gui", "headless", "nogui"]:
+    no_gui = True
 out_dir = '/'.join(json_fn.split('/')[:-1])
 with open(json_fn, 'r') as fin:
     replay_data = json.load(fin)
@@ -30,13 +38,14 @@ with open(json_fn, 'r') as fin:
 shape_id, _, _, primact_type, _ = json_fn.split('/')[-2].split('_')
 
 # setup env
-env = Env()
+env = Env(show_gui=(not no_gui))
 
 # setup camera
 cam_theta = replay_data['camera_metadata']['theta']
 cam_phi = replay_data['camera_metadata']['phi']
 cam = Camera(env, theta=cam_theta, phi=cam_phi)
-env.set_controller_camera_pose(cam.pos[0], cam.pos[1], cam.pos[2], np.pi+cam_theta, -cam_phi)
+if env.show_gui:
+    env.set_controller_camera_pose(cam.pos[0], cam.pos[1], cam.pos[2], np.pi+cam_theta, -cam_phi)
 
 # load shape
 object_urdf_fn = '../data/where2act_original_sapien_dataset/%s/mobility_vhacd.urdf' % shape_id
@@ -145,19 +154,36 @@ if action_direction is not None:
     end_rotmat[:3, 3] = position_world - up * final_dist + action_direction * 0.05
 
 # setup robot
-robot_urdf_fn = './robots/panda_gripper.urdf'
 robot_material = env.get_material(4, 4, 0.01)
-robot = Robot(env, robot_urdf_fn, robot_material, open_gripper=('pulling' in primact_type))
+recorded_robot_type = replay_data.get('robot_type', 'panda')
+recorded_urdf = replay_data.get('robot_urdf', './robots/shadowhand/shadowhand_ign_shadow_hand_fixed.urdf')
+
+# priority: CLI robot_type > recorded robot_type
+robot_type = robot_type or recorded_robot_type
+if robot_type == 'shadowhand':
+    robot_urdf_fn = recorded_urdf
+    robot = ShadowHandRobot(env, robot_urdf_fn, robot_material, open_gripper=('pulling' in primact_type))
+else:
+    robot_urdf_fn = './robots/panda_gripper.urdf'
+    robot = Robot(env, robot_urdf_fn, robot_material, open_gripper=('pulling' in primact_type))
+print(f"[Replay] Using robot_type={robot_type}, urdf={robot_urdf_fn}")
 
 # start pose
 robot.robot.set_root_pose(start_pose)
 env.render()
+# save start view
+rgb0, _ = cam.get_observation()
+Image.fromarray((rgb0*255).astype(np.uint8)).save(os.path.join(out_dir, 'replay_start.png'))
 
-# activate contact checking
-env.start_checking_contact(robot.hand_actor_id, robot.gripper_actor_ids, 'pushing' in primact_type)
+# activate contact checking (relax for shadowhand to avoid early abort)
+strict_contact = ('pushing' in primact_type)
+if robot_type == 'shadowhand':
+    strict_contact = False
+env.start_checking_contact(robot.hand_actor_id, robot.gripper_actor_ids, strict_contact)
 
-### wait to start
-env.wait_to_start()
+### wait to start (only if GUI)
+if env.show_gui:
+    env.wait_to_start()
 
 ### main steps
 print('Start qpos: ', env.get_target_part_qpos())
@@ -171,21 +197,31 @@ if 'pushing' in primact_type:
 elif 'pulling' in primact_type:
     robot.open_gripper()
 
-# approach
-robot.move_to_target_pose(final_rotmat, 2000)
-robot.wait_n_steps(2000)
-
-if 'pulling' in primact_type:
-    robot.close_gripper()
+try:
+    # approach
+    robot.move_to_target_pose(final_rotmat, 2000)
     robot.wait_n_steps(2000)
+    # save after approach
+    rgb1, _ = cam.get_observation()
+    Image.fromarray((rgb1*255).astype(np.uint8)).save(os.path.join(out_dir, 'replay_after_approach.png'))
 
-if 'left' in primact_type or 'up' in primact_type:
-    robot.move_to_target_pose(end_rotmat, 2000)
-    robot.wait_n_steps(2000)
+    if 'pulling' in primact_type:
+        robot.close_gripper()
+        robot.wait_n_steps(2000)
 
-if primact_type == 'pulling':
-    robot.move_to_target_pose(start_rotmat, 2000)
-    robot.wait_n_steps(2000)
+    if 'left' in primact_type or 'up' in primact_type:
+        robot.move_to_target_pose(end_rotmat, 2000)
+        robot.wait_n_steps(2000)
+
+    if primact_type == 'pulling':
+        robot.move_to_target_pose(start_rotmat, 2000)
+        robot.wait_n_steps(2000)
+except ContactError:
+    print('[Replay] ContactError caught, saving current visualization and continuing...')
+
+# final snapshot
+rgb2, _ = cam.get_observation()
+Image.fromarray((rgb2*255).astype(np.uint8)).save(os.path.join(out_dir, 'replay_end.png'))
 
 target_link_mat44 = env.get_target_part_pose().to_transformation_matrix()
 position_world_xyz1_end = target_link_mat44 @ position_local_xyz1
@@ -194,6 +230,9 @@ print(position_world_xyz1_end[:3])
 
 print('Final qpos: ', env.get_target_part_qpos())
 
-### wait forever
-robot.wait_n_steps(100000000000)
+### if GUI, keep rendering; otherwise exit
+if env.show_gui:
+    robot.wait_n_steps(100000000000)
+else:
+    env.close()
 

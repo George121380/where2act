@@ -18,6 +18,7 @@ from sapien.core import Pose
 from env import Env, ContactError
 from camera import Camera
 from robots.panda_robot import Robot
+from robots.shadowhand_robot import ShadowHandRobot
 
 parser = ArgumentParser()
 parser.add_argument('shape_id', type=str)
@@ -28,6 +29,8 @@ parser.add_argument('--out_dir', type=str, default='/media/george/Projects/Resea
 parser.add_argument('--trial_id', type=int, default=0, help='trial id')
 parser.add_argument('--random_seed', type=int, default=None)
 parser.add_argument('--no_gui', action='store_true', default=True, help='no_gui [default: False]')
+parser.add_argument('--robot_type', type=str, default='panda', choices=['panda', 'shadowhand'], help='robot type to use')
+parser.add_argument('--shadowhand_urdf', type=str, default='./robots/shadowhand/shadowhand_ign_shadow_hand_fixed.urdf', help='URDF path for Shadow Hand')
 args = parser.parse_args()
 
 shape_id = args.shape_id
@@ -206,9 +209,17 @@ if action_direction is not None:
 
 ### viz the EE gripper position
 # setup robot
-robot_urdf_fn = './robots/panda_gripper.urdf'
 robot_material = env.get_material(4, 4, 0.01)
-robot = Robot(env, robot_urdf_fn, robot_material, open_gripper=('pulling' in primact_type))
+if args.robot_type == 'panda':
+    robot_urdf_fn = './robots/panda_gripper.urdf'
+    robot = Robot(env, robot_urdf_fn, robot_material, open_gripper=('pulling' in primact_type))
+else:
+    robot_urdf_fn = args.shadowhand_urdf
+    robot = ShadowHandRobot(env, robot_urdf_fn, robot_material, open_gripper=('pulling' in primact_type))
+
+# record robot metadata
+out_info['robot_type'] = args.robot_type
+out_info['robot_urdf'] = robot_urdf_fn
 
 # move to the final pose
 robot.robot.set_root_pose(final_pose)
