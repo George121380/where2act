@@ -1,0 +1,5 @@
+---
+description: Always run code in where2act conda environment
+globs:
+alwaysApply: true
+---

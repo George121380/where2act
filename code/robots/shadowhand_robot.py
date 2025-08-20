@@ -105,15 +105,19 @@ class ShadowHandRobot(object):
 
         # All joints with DOF > 0 are finger/wrist joints for driving
         self.joints = [j for j in self.robot.get_joints() if j.get_dof() > 0]
+        # Stronger stiffness/damping to ensure motion converges
         for j in self.joints:
-            # Modest stiffness/damping for stable motion
-            j.set_drive_property(stiffness=50.0, damping=5.0)
+            j.set_drive_property(stiffness=400.0, damping=40.0)
 
-        # Cache joint limits for open/close presets
+        # Cache joint limits and filter movable joints
         self.joint_limits = {}
+        self.movable_joints = []
         for j in self.joints:
             lim = j.get_limits()[0]
-            self.joint_limits[j.get_name()] = (float(lim[0]), float(lim[1]))
+            lo, hi = float(lim[0]), float(lim[1])
+            self.joint_limits[j.get_name()] = (lo, hi)
+            if (hi - lo) > 1e-4:
+                self.movable_joints.append(j)
 
         if open_gripper:
             self.open_gripper()
@@ -128,16 +132,24 @@ class ShadowHandRobot(object):
     def open_gripper(self):
         """Open hand by moving joints towards upper limits (where applicable)."""
         targets = {}
-        for name, (lo, hi) in self.joint_limits.items():
-            # For most finger joints, larger angle corresponds to opening from closed contact
+        for j in self.movable_joints:
+            name = j.get_name()
+            lo, hi = self.joint_limits[name]
             targets[name] = hi
+        # zero velocity target helps PD converge without overshoot
+        for j in self.joints:
+            j.set_drive_velocity_target(0.0)
         self._set_joint_targets(targets)
 
     def close_gripper(self):
         """Close hand by moving joints towards lower limits."""
         targets = {}
-        for name, (lo, hi) in self.joint_limits.items():
+        for j in self.movable_joints:
+            name = j.get_name()
+            lo, hi = self.joint_limits[name]
             targets[name] = lo
+        for j in self.joints:
+            j.set_drive_velocity_target(0.0)
         self._set_joint_targets(targets)
 
     def move_to_target_pose(self, target_ee_pose: np.ndarray, num_steps: int) -> None:
@@ -168,6 +180,9 @@ class ShadowHandRobot(object):
     def wait_n_steps(self, n: int):
         """Let physics settle while keeping current drive targets."""
         for _ in range(n):
+            # keep velocity target zero for all joints to let position PD converge
+            for j in self.joints:
+                j.set_drive_velocity_target(0.0)
             passive = self.robot.compute_passive_force()
             self.robot.set_qf(passive)
             self.env.step()

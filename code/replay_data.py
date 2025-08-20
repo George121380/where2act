@@ -13,6 +13,7 @@ import numpy as np
 from utils import get_global_position_from_camera
 import json
 import h5py
+from argparse import ArgumentParser
 
 from sapien.core import Pose
 from env import Env, ContactError
@@ -23,14 +24,16 @@ from robots.shadowhand_robot import ShadowHandRobot
 from PIL import Image
 from subprocess import call
 
-json_fn = sys.argv[1]
-robot_type = None
-no_gui = False
-# optional args: [robot_type] [no_gui]
-if len(sys.argv) > 2 and sys.argv[2].strip() != "":
-    robot_type = sys.argv[2]
-if len(sys.argv) > 3 and sys.argv[3].strip().lower() in ["no_gui", "headless", "nogui"]:
-    no_gui = True
+parser = ArgumentParser()
+parser.add_argument('json_fn', type=str)
+parser.add_argument('--robot_type', type=str, choices=['panda', 'shadowhand'], default=None)
+parser.add_argument('--no_gui', action='store_true', default=False)
+args = parser.parse_args()
+
+json_fn = args.json_fn
+robot_type = args.robot_type
+no_gui = args.no_gui
+
 out_dir = '/'.join(json_fn.split('/')[:-1])
 with open(json_fn, 'r') as fin:
     replay_data = json.load(fin)
@@ -43,17 +46,123 @@ env = Env(show_gui=(not no_gui))
 # setup camera
 cam_theta = replay_data['camera_metadata']['theta']
 cam_phi = replay_data['camera_metadata']['phi']
-cam = Camera(env, theta=cam_theta, phi=cam_phi)
+cam_dist = replay_data['camera_metadata'].get('dist', 5.0)
+cam_fov = replay_data['camera_metadata'].get('fov', 35)
+cam = Camera(env, theta=cam_theta, phi=cam_phi, dist=cam_dist, fov=np.rad2deg(cam_fov))
 if env.show_gui:
     env.set_controller_camera_pose(cam.pos[0], cam.pos[1], cam.pos[2], np.pi+cam_theta, -cam_phi)
 
-# load shape
-object_urdf_fn = '../data/where2act_original_sapien_dataset/%s/mobility_vhacd.urdf' % shape_id
+# load shape (respect object_mode recorded during collection)
 object_material = env.get_material(4, 4, 0.01)
-state = replay_data['object_state']
-print( 'Object State: %s' % state)
+state = replay_data.get('object_state', 'closed')
+print('Object State: %s' % state)
+object_mode = replay_data.get('object_mode', 'dataset')
+object_urdf_fn = None
+if object_mode == 'dataset':
+    object_urdf_fn = '../data/where2act_original_sapien_dataset/%s/mobility_vhacd.urdf' % shape_id
+elif object_mode == 'asset':
+    object_urdf_fn = replay_data.get('asset_urdf', None)
+elif object_mode == 'simple':
+    object_urdf_fn = replay_data.get('object_urdf_override', replay_data.get('object_urdf_builtin', None))
+if object_urdf_fn is None:
+    # fallback to dataset path
+    object_urdf_fn = '../data/where2act_original_sapien_dataset/%s/mobility_vhacd.urdf' % shape_id
+print(f"[Replay] object_mode={object_mode}, urdf={object_urdf_fn}")
 env.load_object(object_urdf_fn, object_material, state=state)
-env.set_object_joint_angles(replay_data['joint_angles'])
+
+# Immediately check if object was loaded correctly
+print(f"[DEBUG] After load_object: env.object = {env.object}")
+if env.object is not None:
+    print(f"[DEBUG] Object loaded successfully, root pose: {env.object.get_root_pose()}")
+    # Check object links instead of scene actors
+    object_links = env.object.get_links()
+    print(f"[DEBUG] Object has {len(object_links)} links")
+    for i, link in enumerate(object_links):
+        try:
+            pose = link.get_pose()
+            name = link.get_name() if hasattr(link, 'get_name') else f"link_{i}"
+            print(f"[DEBUG] Link {i} ({name}): pos={pose.p}, id={link.get_id()}")
+        except Exception as e:
+            print(f"[DEBUG] Link {i}: <error getting info: {e}>")
+    
+    # Force a render step to ensure object is visible
+    env.step()
+    env.render()
+    print(f"[DEBUG] After render step")
+else:
+    print(f"[DEBUG] ERROR: Object loading failed!")
+
+# For simple objects, we need to position them correctly based on the interaction point
+# The interaction point should be on the object surface, so we can use it to position the object
+if object_mode == 'simple':
+    # For simple objects, place them in the center of camera view for better visibility
+    # Calculate camera forward direction and place object in front of camera
+    cam_forward = -np.array(cam.pos) / np.linalg.norm(cam.pos)  # Camera looks towards origin
+    obj_distance = 0.5  # Place object 0.5m in front of camera
+    obj_position = cam.pos + cam_forward * obj_distance
+    obj_pose = Pose(p=obj_position.tolist(), q=[1, 0, 0, 0])
+    env.object.set_root_pose(obj_pose)
+    print(f"[DEBUG] Repositioned simple object to camera center: {obj_position}")
+    print(f"[DEBUG] Camera forward: {cam_forward}")
+
+# quick sanity snapshot of object right after loading
+rgb_loaded, _ = cam.get_observation()
+print(f"[DEBUG] Object loaded, rgb shape: {rgb_loaded.shape}, min/max: {rgb_loaded.min():.3f}/{rgb_loaded.max():.3f}")
+print(f"[DEBUG] Camera position: {cam.pos}")
+print(f"[DEBUG] Camera mat44: {cam.mat44}")
+
+# Additional debugging for object visibility
+if object_mode == 'simple':
+    obj_pos = env.object.get_root_pose().p
+    cam_to_obj = np.array(obj_pos) - np.array(cam.pos)
+    cam_to_obj_dist = np.linalg.norm(cam_to_obj)
+    print(f"[DEBUG] Object position: {obj_pos}")
+    print(f"[DEBUG] Camera to object distance: {cam_to_obj_dist:.3f}")
+    print(f"[DEBUG] Camera to object vector: {cam_to_obj}")
+    
+    # Check if object is in camera frustum
+    cam_forward = -np.array(cam.pos) / np.linalg.norm(cam.pos)
+    obj_dot_cam = np.dot(cam_to_obj, cam_forward)
+    print(f"[DEBUG] Object dot camera forward: {obj_dot_cam:.3f}")
+    
+    # Check scene objects
+    scene_actors = env.scene.get_all_actors()
+    print(f"[DEBUG] Scene has {len(scene_actors)} actors")
+    for i, actor in enumerate(scene_actors[:5]):  # Show first 5
+        try:
+            pose = actor.get_pose()
+            print(f"[DEBUG] Actor {i}: {actor.get_name()}, pos={pose.p}")
+        except:
+            print(f"[DEBUG] Actor {i}: <error getting info>")
+
+Image.fromarray((rgb_loaded*255).astype(np.uint8)).save(os.path.join(out_dir, 'replay_object_loaded.png'))
+try:
+    from PIL import Image as _Image
+    import numpy as _np
+    obj_mask = cam.get_object_mask().astype(_np.uint8) * 255
+    print(f"[DEBUG] Object mask shape: {obj_mask.shape}, min/max: {obj_mask.min()}/{obj_mask.max()}")
+    _Image.fromarray(obj_mask).save(os.path.join(out_dir, 'replay_object_mask.png'))
+    # also save movable link mask using segmentation
+    link_ids = env.movable_link_ids
+    seg_mask = cam.get_movable_link_mask(link_ids).astype(_np.uint8) * 20
+    print(f"[DEBUG] Seg mask shape: {seg_mask.shape}, min/max: {seg_mask.min()}/{seg_mask.max()}")
+    _Image.fromarray(seg_mask).save(os.path.join(out_dir, 'replay_seg_mask.png'))
+    # dump links for debugging
+    try:
+        links_info = [{'id': int(l.get_id()), 'name': str(l.get_name())} for l in env.object.get_links()]
+        with open(os.path.join(out_dir, 'replay_links.json'), 'w') as f:
+            json.dump({'links': links_info, 'movable_link_ids': [int(x) for x in link_ids]}, f)
+        print(f"[DEBUG] Object links: {links_info}")
+        print(f"[DEBUG] Movable link IDs: {[int(x) for x in link_ids]}")
+        # check object pose
+        obj_pose = env.object.get_root_pose()
+        print(f"[DEBUG] Object root pose: p={obj_pose.p}, q={obj_pose.q}")
+    except Exception:
+        pass
+except Exception:
+    pass
+if len(replay_data.get('joint_angles', [])) > 0:
+    env.set_object_joint_angles(replay_data['joint_angles'])
 cur_qpos = env.get_object_qpos()
 
 # simulate some steps for the object to stay rest
@@ -71,10 +180,17 @@ while still_timesteps < 5000 and wait_timesteps < 20000:
                 break
         if invalid_contact:
             break
-    if np.max(np.abs(cur_new_qpos - cur_qpos)) < 1e-6 and (not invalid_contact):
-        still_timesteps += 1
+    # handle rigid objects with empty qpos
+    if len(cur_new_qpos) == 0 and len(cur_qpos) == 0:
+        if not invalid_contact:
+            still_timesteps += 1
+        else:
+            still_timesteps = 0
     else:
-        still_timesteps = 0
+        if np.max(np.abs(cur_new_qpos - cur_qpos)) < 1e-6 and (not invalid_contact):
+            still_timesteps += 1
+        else:
+            still_timesteps = 0
     cur_qpos = cur_new_qpos
     wait_timesteps += 1
 
@@ -175,15 +291,13 @@ env.render()
 rgb0, _ = cam.get_observation()
 Image.fromarray((rgb0*255).astype(np.uint8)).save(os.path.join(out_dir, 'replay_start.png'))
 
-# activate contact checking (relax for shadowhand to avoid early abort)
+# activate contact checking (skip for shadowhand to avoid early abort on first timestep)
+enable_contact_check = True
 strict_contact = ('pushing' in primact_type)
 if robot_type == 'shadowhand':
-    strict_contact = False
-env.start_checking_contact(robot.hand_actor_id, robot.gripper_actor_ids, strict_contact)
-
-### wait to start (only if GUI)
-if env.show_gui:
-    env.wait_to_start()
+    enable_contact_check = False
+if enable_contact_check:
+    env.start_checking_contact(robot.hand_actor_id, robot.gripper_actor_ids, strict_contact)
 
 ### main steps
 print('Start qpos: ', env.get_target_part_qpos())

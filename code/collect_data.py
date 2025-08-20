@@ -13,6 +13,7 @@ from utils import get_global_position_from_camera, save_h5
 import cv2
 import json
 from argparse import ArgumentParser
+import sapien
 
 from sapien.core import Pose
 from env import Env, ContactError
@@ -31,6 +32,13 @@ parser.add_argument('--random_seed', type=int, default=None)
 parser.add_argument('--no_gui', action='store_true', default=True, help='no_gui [default: False]')
 parser.add_argument('--robot_type', type=str, default='panda', choices=['panda', 'shadowhand'], help='robot type to use')
 parser.add_argument('--shadowhand_urdf', type=str, default='./robots/shadowhand/shadowhand_ign_shadow_hand_fixed.urdf', help='URDF path for Shadow Hand')
+parser.add_argument('--debug_dump_hand_qpos', action='store_true', default=False, help='dump hand qpos and snapshots for debugging')
+parser.add_argument('--object_mode', type=str, default='dataset', choices=['dataset', 'asset', 'simple'], help='where to load the object from')
+parser.add_argument('--sapien_asset_id', type=int, default=None, help='SAPIEN PartNet-Mobility asset id (when object_mode=asset)')
+parser.add_argument('--sapien_asset_token', type=str, default=None, help='SAPIEN asset access token (fallback to env SAPIEN_ASSET_TOKEN)')
+parser.add_argument('--object_urdf_override', type=str, default=None, help='override URDF path when object_mode=simple')
+parser.add_argument('--camera_dist', type=float, default=None, help='override camera distance (meters)')
+parser.add_argument('--camera_fov_deg', type=float, default=None, help='override camera vertical fov (degrees)')
 args = parser.parse_args()
 
 shape_id = args.shape_id
@@ -54,21 +62,63 @@ if args.random_seed is not None:
 # setup env
 env = Env(flog=flog, show_gui=(not args.no_gui))
 
+# For simple objects, position them in a more visible location
+if getattr(args, 'object_mode', 'dataset') == 'simple':
+    # Set object position offset to place object in camera view
+    env.object_position_offset = 0.0  # Keep at origin, but we'll adjust camera
+
 # setup camera
-cam = Camera(env, random_position=True)
+# For simple objects, default to a closer camera to make small boxes visible
+default_camera_dist = 5.0
+if getattr(args, 'object_mode', 'dataset') == 'simple':
+    default_camera_dist = 1.5
+cam_dist = args.camera_dist if args.camera_dist is not None else default_camera_dist
+cam_fov_deg = args.camera_fov_deg if args.camera_fov_deg is not None else 35
+cam = Camera(env, random_position=True, dist=cam_dist, fov=cam_fov_deg)
 out_info['camera_metadata'] = cam.get_metadata_json()
 if not args.no_gui:
     env.set_controller_camera_pose(cam.pos[0], cam.pos[1], cam.pos[2], np.pi+cam.theta, -cam.phi)
 
 # load shape
-object_urdf_fn = '../data/where2act_original_sapien_dataset/%s/mobility_vhacd.urdf' % shape_id
-flog.write('object_urdf_fn: %s\n' % object_urdf_fn)
 object_material = env.get_material(4, 4, 0.01)
+
+# decide URDF source
+object_mode = getattr(args, 'object_mode', 'dataset')
+out_info['object_mode'] = object_mode
+if object_mode == 'dataset':
+    object_urdf_fn = '../data/where2act_original_sapien_dataset/%s/mobility_vhacd.urdf' % shape_id
+elif object_mode == 'asset':
+    asset_id = args.sapien_asset_id
+    token = args.sapien_asset_token or os.environ.get('SAPIEN_ASSET_TOKEN')
+    if asset_id is None or token is None:
+        flog.write('ERROR: asset mode requires --sapien_asset_id and a valid token (CLI or env SAPIEN_ASSET_TOKEN)\n')
+        flog.close(); env.close(); sys.exit(2)
+    try:
+        object_urdf_fn = sapien.asset.download_partnet_mobility(asset_id, token)
+        out_info['sapien_asset_id'] = int(asset_id)
+        out_info['asset_urdf'] = object_urdf_fn
+    except Exception as e:
+        flog.write(f'ERROR: failed to download/load SAPIEN asset {asset_id}: {e}\n')
+        flog.close(); env.close(); sys.exit(2)
+else:
+    # simple mode: use override URDF if provided; otherwise use built-in rectangular box
+    if args.object_urdf_override is not None:
+        object_urdf_fn = args.object_urdf_override
+        out_info['object_urdf_override'] = object_urdf_fn
+    else:
+        object_urdf_fn = './objects/simple/box_rect_060408.urdf'
+        out_info['object_urdf_builtin'] = object_urdf_fn
+
+flog.write('object_urdf_fn: %s\n' % object_urdf_fn)
+
+# decide initial state (for articulated assets)
 state = 'random-closed-middle'
 if np.random.random() < 0.5:
     state = 'closed'
 flog.write('Object State: %s\n' % state)
 out_info['object_state'] = state
+
+# load into scene
 joint_angles = env.load_object(object_urdf_fn, object_material, state=state)
 out_info['joint_angles'] = joint_angles
 out_info['joint_angles_lower'] = env.joint_angles_lower
@@ -90,10 +140,17 @@ while still_timesteps < 5000 and wait_timesteps < 20000:
                 break
         if invalid_contact:
             break
-    if np.max(np.abs(cur_new_qpos - cur_qpos)) < 1e-6 and (not invalid_contact):
-        still_timesteps += 1
+    # handle articulated vs rigid objects (no joints => empty qpos)
+    if len(cur_new_qpos) == 0 and len(cur_qpos) == 0:
+        if not invalid_contact:
+            still_timesteps += 1
+        else:
+            still_timesteps = 0
     else:
-        still_timesteps = 0
+        if np.max(np.abs(cur_new_qpos - cur_qpos)) < 1e-6 and (not invalid_contact):
+            still_timesteps += 1
+        else:
+            still_timesteps = 0
     cur_qpos = cur_new_qpos
     wait_timesteps += 1
 
@@ -221,22 +278,64 @@ else:
 out_info['robot_type'] = args.robot_type
 out_info['robot_urdf'] = robot_urdf_fn
 
-# move to the final pose
+# helper for debug dumping
+def _debug_dump(stage_name: str):
+    if not args.debug_dump_hand_qpos:
+        return
+    try:
+        # save articulation qpos
+        qpos = robot.robot.get_qpos()
+        with open(os.path.join(out_dir, f'hand_qpos_{stage_name}.json'), 'w') as f:
+            json.dump({'stage': stage_name, 'qpos': [float(x) for x in qpos]}, f)
+        # save snapshot
+        rgb_dbg, _ = cam.get_observation()
+        Image.fromarray((rgb_dbg*255).astype(np.uint8)).save(os.path.join(out_dir, f'hand_{stage_name}.png'))
+    except Exception as e:
+        flog.write(f'DEBUG_DUMP_ERROR@{stage_name}: {e}\n')
+
+# dump joint meta for shadowhand
+if args.robot_type == 'shadowhand':
+    try:
+        joints_meta = []
+        for j in robot.robot.get_joints():
+            meta = {
+                'name': j.get_name(),
+                'dof': int(j.get_dof()),
+            }
+            try:
+                lim = j.get_limits()
+                if lim is not None and len(lim) > 0:
+                    lo, hi = float(lim[0][0]), float(lim[0][1])
+                    meta['limit'] = [lo, hi]
+            except Exception:
+                pass
+            joints_meta.append(meta)
+        with open(os.path.join(out_dir, 'hand_joint_info.json'), 'w') as f:
+            json.dump({'joints': joints_meta, 'initial_qpos': [float(x) for x in robot.robot.get_qpos()]}, f)
+    except Exception as e:
+        flog.write(f'WARN: joint meta dump failed: {e}\n')
+
+# pre-op open/close away from object (before enabling contact checking)
+robot.robot.set_root_pose(start_pose)
+env.render()
+if args.robot_type == 'shadowhand':
+    # ensure joints respond without contact interruption
+    robot.open_gripper(); robot.wait_n_steps(1000); _debug_dump('preop_after_open')
+    robot.close_gripper(); robot.wait_n_steps(1000); _debug_dump('preop_after_close')
+
+# visualize final pose for approach
 robot.robot.set_root_pose(final_pose)
 env.render()
 rgb_final_pose, _ = cam.get_observation()
 Image.fromarray((rgb_final_pose*255).astype(np.uint8)).save(os.path.join(out_dir, 'viz_target_pose.png'))
+_debug_dump('at_final_pose')
 
-# move back
+# move back to start for normal pipeline
 robot.robot.set_root_pose(start_pose)
 env.render()
 
 # activate contact checking
 env.start_checking_contact(robot.hand_actor_id, robot.gripper_actor_ids, 'pushing' in primact_type)
-
-if not args.no_gui:
-    ### wait to start
-    env.wait_to_start()
 
 ### main steps
 out_info['start_target_part_qpos'] = env.get_target_part_qpos()
@@ -247,16 +346,16 @@ position_local_xyz1 = np.linalg.inv(target_link_mat44) @ position_world_xyz1
 success = True
 try:
     if 'pushing' in primact_type:
-        robot.close_gripper()
+        robot.close_gripper(); robot.wait_n_steps(500); _debug_dump('after_close_for_push')
     elif 'pulling' in primact_type:
-        robot.open_gripper()
+        robot.open_gripper(); robot.wait_n_steps(500); _debug_dump('after_open_for_pull')
 
     # approach
     robot.move_to_target_pose(final_rotmat, 2000)
     robot.wait_n_steps(2000)
 
     if 'pulling' in primact_type:
-        robot.close_gripper()
+        robot.close_gripper(); robot.wait_n_steps(500); _debug_dump('after_close_for_pull')
         robot.wait_n_steps(2000)
     
     if 'left' in primact_type or 'up' in primact_type:

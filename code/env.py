@@ -91,9 +91,14 @@ class Env(object):
         # compute link actor information
         self.all_link_ids = [l.get_id() for l in self.object.get_links()]
         self.movable_link_ids = []
+        self._has_1dof_joint = False
         for j in self.object.get_joints():
             if j.get_dof() == 1:
+                self._has_1dof_joint = True
                 self.movable_link_ids.append(j.get_child_link().get_id())
+        # fallback for rigid objects (no 1-DOF joints): treat the whole object as movable target
+        if len(self.movable_link_ids) == 0 and len(self.all_link_ids) > 0:
+            self.movable_link_ids = list(self.all_link_ids)
         if self.flog is not None:
             self.flog.write('All Actor Link IDs: %s\n' % str(self.all_link_ids))
             self.flog.write('All Movable Actor Link IDs: %s\n' % str(self.movable_link_ids))
@@ -138,13 +143,23 @@ class Env(object):
         self.non_target_object_part_actor_id = list(set(self.all_link_ids) - set([actor_id]))
 
         # get the link handler
+        found = False
         for j in self.object.get_joints():
             if j.get_dof() == 1:
                 if j.get_child_link().get_id() == actor_id:
                     self.target_object_part_actor_link = j.get_child_link()
+                    found = True
+                    break
+        if not found:
+            # rigid object: find link by id
+            for l in self.object.get_links():
+                if l.get_id() == actor_id:
+                    self.target_object_part_actor_link = l
+                    break
         
         # moniter the target joint
         idx = 0
+        self.target_object_part_joint_id = -1
         for j in self.object.get_joints():
             if j.get_dof() == 1:
                 if j.get_child_link().get_id() == actor_id:
@@ -156,6 +171,8 @@ class Env(object):
 
     def get_target_part_qpos(self):
         qpos = self.object.get_qpos()
+        if len(qpos) == 0 or self.target_object_part_joint_id < 0:
+            return 0.0
         return float(qpos[self.target_object_part_joint_id])
     
     def get_target_part_pose(self):
